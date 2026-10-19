@@ -23,8 +23,11 @@ herald-transit advisory <url>                    # full text of a wmata.com advi
 herald-transit gtfs status                       # when the schedule was last built
 ```
 
-Places: a gazetteer name from Herald's known places (`Denton Hall`, `UMD campus`, `Home`), an
-address, `lat,lon`, or a stop code. Times are 12-hour. `--json` on any command.
+Places: `here` (the newest shared location: from Telegram, where the user can share
+live, or a location server; the command prints how old the fix is, so say so if it is
+stale), a gazetteer name from Herald's known places (`Denton Hall`, `UMD campus`,
+`Home`), an address, `lat,lon`, or a stop code. With no recent fix, ask them to share
+their location on Telegram. Times are 12-hour. `--json` on any command.
 
 ## What each answer rests on, and where it is wrong
 

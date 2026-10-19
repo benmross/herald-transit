@@ -21,7 +21,9 @@ FEED = {"wb": "Metrobus", "wr": "Metro", "ro": "Ride On"}
 # ---- parsing what a person types ----------------------------------------
 
 def place(text, con=None):
-    """'lat,lon', a gazetteer name, a stop code, or an address -> (lat, lon, label)."""
+    """'here', 'lat,lon', a gazetteer name, a stop code, or an address -> (lat, lon, label)."""
+    if text.strip().lower() in ("here", "me", "my location", "current location"):
+        return here()
     m = re.fullmatch(r"\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*", text)
     if m:
         return float(m[1]), float(m[2]), text
@@ -36,6 +38,28 @@ def place(text, con=None):
     if not g:
         raise SystemExit(f"Could not place {text!r}. Give an address, 'lat,lon' or a stop code.")
     return g["lat"], g["lon"], g.get("display_name") or text
+
+
+def here():
+    """The newest `current` fact from any source: a location shared on
+    Telegram, or a location server. Says how old it is, because a fix from
+    this morning is not where someone is now."""
+    from herald import db
+    import json as _json
+    with db.session() as con:
+        row = con.execute("SELECT ts, title, data FROM facts WHERE kind='current' "
+                          "ORDER BY ts DESC LIMIT 1").fetchone()
+    if not row:
+        raise SystemExit("No location on file. Share your location with Herald on "
+                         "Telegram (live, to keep it current), or give a place.")
+    data = _json.loads(row["data"] or "{}")
+    try:
+        then = datetime.datetime.fromisoformat(row["ts"])
+        age = round((datetime.datetime.now(then.tzinfo) - then).total_seconds() / 60)
+        print(f"here = {row['title']}, fix {age} min old", file=sys.stderr)
+    except ValueError:
+        pass
+    return float(data["lat"]), float(data["lon"]), f"here ({row['title']})"
 
 
 def stop_lookup(con, text, quiet=False):
