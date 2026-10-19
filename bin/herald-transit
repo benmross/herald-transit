@@ -1,0 +1,326 @@
+#!/usr/bin/env python
+"""Transit for the DC region: plan trips, live arrivals, vehicles and detours.
+
+Metrobus and Metrorail come from WMATA; Ride On from its GTFS and RideOn.app.
+Every command prints plain text meant to be read by a session and answered
+from, and takes --json for the raw structure.
+"""
+import argparse, datetime, json, os, pathlib, re, shutil, sys
+
+_EXT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_EXT / "lib"))
+_root = os.environ.get("HERALD_ROOT") or str(pathlib.Path(shutil.which("herald")).resolve().parents[1])
+sys.path.insert(0, str(pathlib.Path(_root) / "lib"))
+
+from herald import geo
+from transit import gtfs, live, plan as planner
+
+FEED = {"wb": "Metrobus", "wr": "Metro", "ro": "Ride On"}
+
+
+# ---- parsing what a person types ----------------------------------------
+
+def place(text, con=None):
+    """'lat,lon', a gazetteer name, a stop code, or an address -> (lat, lon, label)."""
+    m = re.fullmatch(r"\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*", text)
+    if m:
+        return float(m[1]), float(m[2]), text
+    for p in geo.known_places():
+        if p.get("name", "").lower() == text.lower():
+            return float(p["lat"]), float(p["lon"]), p["name"]
+    con = con or gtfs.connect()
+    s = stop_lookup(con, text, quiet=True)
+    if s:
+        return s["lat"], s["lon"], s["name"]
+    g = geo.geocode(text)
+    if not g:
+        raise SystemExit(f"Could not place {text!r}. Give an address, 'lat,lon' or a stop code.")
+    return g["lat"], g["lon"], g.get("display_name") or text
+
+
+def stop_lookup(con, text, quiet=False):
+    text = text.strip()
+    row = con.execute("SELECT * FROM stops WHERE id=? OR (code=? AND kind=0) OR (feed='wr' AND id=?)",
+                      (text, text, "wr:STN_" + text.upper())).fetchone()
+    if row is None and re.fullmatch(r"\d{5}", text):   # Ride On sign numbers
+        row = con.execute("SELECT * FROM stops WHERE feed='ro' AND code=?", (text,)).fetchone()
+    if row is None and not quiet:
+        raise SystemExit(f"No stop with id or code {text!r}. Try: herald-transit stops near <place>")
+    return row
+
+
+def when(date_s, time_s):
+    today = datetime.date.today()
+    d = today
+    if date_s:
+        s = date_s.lower()
+        names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+        if s == "tomorrow":
+            d = today + datetime.timedelta(days=1)
+        elif s[:3] in names:
+            d = today + datetime.timedelta(days=(names.index(s[:3]) - today.weekday()) % 7)
+        elif s != "today":
+            d = datetime.date.fromisoformat(date_s)
+    if not time_s or time_s == "now":
+        now = datetime.datetime.now()
+        secs = now.hour * 3600 + now.minute * 60 if d == today else 8 * 3600
+    else:
+        t = time_s.strip().upper().replace(".", "")
+        for fmt in ("%I:%M %p", "%I:%M%p", "%I %p", "%I%p", "%H:%M"):
+            try:
+                tt = datetime.datetime.strptime(t, fmt).time()
+                break
+            except ValueError:
+                continue
+        else:
+            raise SystemExit(f"Could not read the time {time_s!r}. Use e.g. 6:30 PM.")
+        secs = tt.hour * 3600 + tt.minute * 60
+    return d, secs
+
+
+def mins(m):
+    return f"{round(m * 1.25 / 1.3 / 60)} min walk"
+
+
+# ---- commands ---------------------------------------------------------------
+
+def cmd_plan(a):
+    con = gtfs.connect()
+    o = place(a.origin, con); d = place(a.dest, con)
+    day, secs = when(a.date, a.arrive or a.depart)
+    res = planner.plan(con, o[:2], d[:2], day.strftime("%Y%m%d"),
+                       depart=None if a.arrive else secs, arrive=secs if a.arrive else None,
+                       max_walk=a.walk, count=a.n)
+    if "error" in res:
+        raise SystemExit(res["error"])
+    js = [planner.describe(con, j) for j in res["journeys"]]
+    if a.json:
+        print(json.dumps(js, indent=1, default=str)); return
+    target = ("arrive by " if a.arrive else "leave at ") + planner.clock(secs)
+    print(f"{o[2]} -> {d[2]}, {day:%a %d %b}, {target}. Schedule only.\n")
+    routes = set()
+    for i, j in enumerate(js, 1):
+        dur = round((j["arrive"] - j["leave"]) / 60)
+        names = [l["route"] for l in j["legs"] if l["mode"] == "ride"]
+        print(f"{i}. Leave {planner.clock(j['leave'])}, arrive {planner.clock(j['arrive'])} "
+              f"({dur} min, {' > '.join(names)})")
+        for l in j["legs"]:
+            if l["mode"] == "walk":
+                frm = "origin" if l.get("from") == "origin" else l.get("from_stop_name")
+                to = "destination" if l.get("to") == "destination" else l.get("to_stop_name")
+                if l["metres"] > 30 or frm in ("origin",) or to == "destination":
+                    print(f"   walk {l['metres']} m ({mins(l['metres'])}) {frm} -> {to}")
+            else:
+                routes.add((l["feed"], l["route"]))
+                kind = FEED[l["feed"]] + (" " + l["route"] + " Line" if l["rail"] else " " + l["route"])
+                print(f"   {planner.clock(l['depart'])} {kind} toward {l['headsign']}: "
+                      f"{l['from_stop_name']} -> {l['to_stop_name']}, arrive {planner.clock(l['arrive'])}")
+        print()
+    if not a.no_live:
+        notes = disruptions(routes, day)
+        if notes:
+            print("Disruptions on these routes for that day:")
+            for n in notes:
+                print("  - " + n)
+        else:
+            print("No detours or alerts found for these routes on that day.")
+
+
+def disruptions(routes, day):
+    out = []
+    bus = sorted(r for f, r in routes if f == "wb")
+    ro = sorted(r for f, r in routes if f == "ro")
+    if bus or any(f == "wr" for f, _ in routes):
+        try:
+            for adv in live.advisories(day.isoformat()):
+                hit = set(adv["routes"]) & set(bus)
+                if hit:
+                    out.append(f"WMATA advisory ({', '.join(sorted(hit))}): {adv['title']}. {adv['summary']} {adv['url']}")
+        except Exception as e:
+            out.append(f"(wmata.com advisories unavailable: {e})")
+        if day == datetime.date.today():
+            try:
+                for al in live.alerts():
+                    hit = set(al.get("routes", [])) & set(bus)
+                    if hit:
+                        out.append(f"Live alert ({', '.join(sorted(hit))}): {al['header']}. {al['description']}")
+            except Exception as e:
+                out.append(f"(live alerts unavailable: {e})")
+    for r in ro:
+        try:
+            for dl in live.rideon_delays(r):
+                out.append(f"Ride On {dl['title']} ({dl['from']} to {dl['to']}): {dl['description']}; "
+                           f"stops affected: {'; '.join(dl['stops'][:6])}")
+        except Exception as e:
+            out.append(f"(Ride On delays unavailable: {e})")
+    return out
+
+
+def arrivals_for(con, row):
+    feed = row["feed"]
+    if feed == "wb":
+        return "Metrobus", live.bus_predictions(row["code"])
+    if feed == "ro":
+        return "Ride On", live.rideon_stop(row["raw_id"])
+    code = (row["parent"] or row["id"]).split("STN_")[-1]
+    return "Metro", {"stop": row["name"], "predictions": live.rail_predictions(code)}
+
+
+def cmd_arrivals(a):
+    con = gtfs.connect()
+    rows = []
+    if a.near:
+        lat, lon, label = place(a.near, con)
+        seen = set()
+        for d, r in gtfs.stops_near(con, lat, lon, a.radius):
+            key = r["parent"] if r["feed"] == "wr" else r["id"]
+            if key not in seen:
+                seen.add(key); rows.append(r)
+    for s in a.stops:
+        rows.append(stop_lookup(con, s))
+    out = []
+    for r in rows:
+        try:
+            agency, res = arrivals_for(con, r)
+        except Exception as e:
+            agency, res = FEED[r["feed"]], {"error": str(e), "predictions": []}
+        if a.route:
+            res["predictions"] = [p for p in res["predictions"]
+                                  if str(p.get("route") or p.get("line")).upper() == a.route.upper()]
+        out.append({"agency": agency, "stop": r["name"], "code": r["code"] or r["raw_id"], **res})
+    if a.json:
+        print(json.dumps(out, indent=1)); return
+    now = datetime.datetime.now()
+    print(f"As of {now:%-I:%M %p}:")
+    for s in out:
+        print(f"\n{s['agency']}: {s['stop']} [{s['code']}]")
+        if s.get("error"):
+            print("   unavailable: " + s["error"]); continue
+        if not s["predictions"]:
+            print("   nothing predicted"); continue
+        for p in s["predictions"][:a.limit]:
+            if s["agency"] == "Metro":
+                print(f"   {p['line']} to {p['to']}: {p['min']} ({p['cars']} cars)")
+            elif s["agency"] == "Ride On":
+                src = "tracked" if p["live"] else "SCHEDULED ONLY"
+                print(f"   {p['route']} to {p['toward']}: {p['minutes']} min ({p['time']}, {src}"
+                      + (f", bus {p['vehicle']}" if p["vehicle"] else "") + ")")
+            else:
+                at = (now + datetime.timedelta(minutes=p["minutes"])).strftime("%-I:%M %p")
+                print(f"   {p['route']} {p['toward']}: {p['minutes']} min ({at}, bus {p['vehicle']})")
+
+
+def cmd_stops(a):
+    con = gtfs.connect()
+    if a.how == "near":
+        lat, lon, label = place(a.query, con)
+        res = [(round(d), r) for d, r in gtfs.stops_near(con, lat, lon, a.radius)]
+    else:
+        res = [(None, r) for r in con.execute(
+            "SELECT s.*, NULL AS routes FROM stops s WHERE kind=0 AND name LIKE ? LIMIT 40", (f"%{a.query}%",))]
+    if a.json:
+        print(json.dumps([{"metres": d, **dict(r)} for d, r in res], indent=1)); return
+    for d, r in res:
+        routes = r["routes"] if "routes" in r.keys() and r["routes"] else ""
+        code = r["code"] or (r["parent"] or "").replace("wr:STN_", "")
+        print(f"{FEED[r['feed']]:9} {code:>8}  {r['name']}" + (f"  ({d} m)" if d is not None else "")
+              + (f"  routes {routes}" if routes else ""))
+
+
+def cmd_vehicles(a):
+    if a.stop:
+        con = gtfs.connect()
+        r = stop_lookup(con, a.stop)
+        if r["feed"] != "ro":
+            raise SystemExit("--stop is for Ride On stops; for Metrobus give the route.")
+        res = live.rideon_approaching(r["raw_id"])
+    else:
+        res = live.bus_positions(a.route)
+    if a.json:
+        print(json.dumps(res, indent=1)); return
+    con = gtfs.connect()
+    for v in res:
+        near = gtfs.stops_near(con, v["lat"], v["lon"], 300, limit=1)
+        where = (f"near {near[0][1]['name']}" if near else f"{v['lat']:.5f},{v['lon']:.5f}")
+        extra = f", {v['deviation_min']} min late" if v.get("deviation_min") else ""
+        extra += f", next stop {v['next_stop']}" if v.get("next_stop") else ""
+        print(f"bus {v['vehicle']} toward {v['toward']}: {where}{extra}")
+    if not res:
+        print("No vehicles reporting.")
+
+
+def cmd_alerts(a):
+    day = when(a.date, None)[0] if a.date else datetime.date.today()
+    out = {"advisories": live.advisories(day.isoformat(), a.route)}
+    if day == datetime.date.today():
+        out["live"] = live.alerts(a.route)
+    out["rideon"] = live.rideon_delays(a.route)
+    if a.json:
+        print(json.dumps(out, indent=1, default=str)); return
+    print(f"WMATA planned advisories in effect {day:%a %d %b}:")
+    for x in out["advisories"]:
+        print(f" - {x['title']} [{', '.join(x['routes'] + [l for l in x['lines'] if l])}] {x['url']}")
+    if "live" in out:
+        print("\nWMATA live alerts:")
+        for x in out["live"]:
+            if "error" in x:
+                print(f" - ({x['source']} unavailable: {x['error']})"); continue
+            print(f" - [{', '.join(x['routes'])}] {x['header']}: {x['description']}")
+    print("\nRide On delays and detours:")
+    for x in out["rideon"]:
+        print(f" - {x['title']} ({x['from']} to {x['to']}): {x['description']}. Stops: {'; '.join(x['stops'])}")
+
+
+def cmd_advisory(a):
+    print(live.advisory_text(a.url))
+
+
+def cmd_gtfs(a):
+    if a.action == "update":
+        print(gtfs.build())
+    else:
+        con = gtfs.connect()
+        for k, v in con.execute("SELECT key, value FROM meta"):
+            print(f"{k}: {v}")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--json", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("plan", help="plan a trip: FROM TO [--depart|--arrive TIME] [--date]")
+    s.add_argument("origin"); s.add_argument("dest")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--depart"); g.add_argument("--arrive")
+    s.add_argument("--date", help="YYYY-MM-DD, today, tomorrow or a weekday")
+    s.add_argument("--walk", type=int, default=900, help="max metres walked at each end")
+    s.add_argument("-n", type=int, default=4)
+    s.add_argument("--no-live", action="store_true", help="skip the detour and alert check")
+    s.set_defaults(fn=cmd_plan)
+    s = sub.add_parser("arrivals", help="live arrivals at stops (codes from signs) or --near a place")
+    s.add_argument("stops", nargs="*"); s.add_argument("--near"); s.add_argument("--radius", type=int, default=250)
+    s.add_argument("--route"); s.add_argument("--limit", type=int, default=6)
+    s.set_defaults(fn=cmd_arrivals)
+    s = sub.add_parser("stops", help="stops near a place, or by name")
+    s.add_argument("how", choices=["near", "find"]); s.add_argument("query")
+    s.add_argument("--radius", type=int, default=400)
+    s.set_defaults(fn=cmd_stops)
+    s = sub.add_parser("vehicles", help="where the buses on a Metrobus route are, or Ride On buses nearing a stop")
+    s.add_argument("route", nargs="?"); s.add_argument("--stop")
+    s.set_defaults(fn=cmd_vehicles)
+    s = sub.add_parser("alerts", help="planned advisories, live alerts and Ride On detours")
+    s.add_argument("--route"); s.add_argument("--date")
+    s.set_defaults(fn=cmd_alerts)
+    s = sub.add_parser("advisory", help="full text of one wmata.com advisory")
+    s.add_argument("url"); s.set_defaults(fn=cmd_advisory)
+    s = sub.add_parser("gtfs", help="update or show the schedule database")
+    s.add_argument("action", choices=["update", "status"]); s.set_defaults(fn=cmd_gtfs)
+    # --json is accepted before or after the subcommand.
+    argv = [x for x in sys.argv[1:] if x != "--json"]
+    a = p.parse_args(argv)
+    a.json = len(argv) != len(sys.argv) - 1
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

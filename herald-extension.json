@@ -1,0 +1,25 @@
+{
+  "name": "transit",
+  "description": "Live and scheduled transit for the DC region: WMATA Metrobus and Metrorail through WMATA's API and GTFS feeds, Montgomery County Ride On through its published GTFS and the live data behind RideOn.app, and a trip planner over all three.",
+  "version": "0.2.0",
+  "enabled": true,
+  "provides_capabilities": [
+    {
+      "key": "wmata",
+      "title": "WMATA API",
+      "summary": "Live Metrobus and Metrorail arrivals, vehicle positions, alerts and detours, plus the static schedules the planner uses.",
+      "secrets": [
+        "transit.wmata_api_key"
+      ],
+      "setup_hint": "Default-tier key from developer.wmata.com; store it with herald secret request transit.wmata_api_key."
+    }
+  ],
+  "requires_capabilities": [],
+  "setup": [
+    {
+      "key": "transit.wmata_api_key",
+      "secret": true,
+      "prompt": "A WMATA API key (free, default tier, from developer.wmata.com)"
+    }
+  ]
+}
