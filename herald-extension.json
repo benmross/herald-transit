@@ -1,7 +1,7 @@
 {
   "name": "transit",
   "description": "Live and scheduled transit for the DC region: WMATA Metrobus and Metrorail through WMATA's API and GTFS feeds, Montgomery County Ride On through its published GTFS and the live data behind RideOn.app, and a trip planner over all three.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "enabled": true,
   "provides_capabilities": [
     {
@@ -21,5 +21,11 @@
       "secret": true,
       "prompt": "A WMATA API key (free, default tier, from developer.wmata.com)"
     }
+  ],
+  "steps": [
+    "Get a free WMATA API key: register at developer.wmata.com and copy the default-tier primary key (Herald asks for it through the secret page).",
+    "Install the realtime decoder: ~/herald/venv/bin/pip install gtfs-realtime-bindings",
+    "Turn it on with herald ext enable transit, then build the schedule once: herald-transit gtfs update (about a minute).",
+    "To plan from where you are, share your location with Herald on Telegram, live if you want it kept current."
   ]
 }
